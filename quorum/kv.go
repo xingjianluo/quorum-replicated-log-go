@@ -13,16 +13,16 @@ type kvStore struct {
 	data    map[string]string
 	applied uint64
 	// 每个客户端已处理的最大 Seq 及其结果，用于重试去重。
-	dedup map[string]dedupRecord
+	dedup map[string]DedupRecord
 }
 
-type dedupRecord struct {
+type DedupRecord struct {
 	Seq    uint64
 	Result string
 }
 
 func newKVStore() *kvStore {
-	return &kvStore{data: map[string]string{}, dedup: map[string]dedupRecord{}}
+	return &kvStore{data: map[string]string{}, dedup: map[string]DedupRecord{}}
 }
 
 // apply 应用一条已提交日志，返回 (结果值, 是否实际应用)。
@@ -59,7 +59,7 @@ func (k *kvStore) apply(index uint64, e Entry) (string, bool) {
 		delete(k.data, cmd.Key)
 	}
 	if cmd.ClientID != "" {
-		k.dedup[cmd.ClientID] = dedupRecord{Seq: cmd.Seq, Result: old}
+		k.dedup[cmd.ClientID] = DedupRecord{Seq: cmd.Seq, Result: old}
 	}
 	return old, true
 }
@@ -87,4 +87,41 @@ func (k *kvStore) snapshot() map[string]string {
 		out[key] = v
 	}
 	return out
+}
+
+// snapshotState 导出做快照所需的全部状态（深拷贝）：
+// 数据、客户端去重表、已应用索引。去重表必须一并快照，
+// 否则日志清理后客户端跨快照重试会被重复应用。
+func (k *kvStore) snapshotState() (map[string]string, map[string]DedupRecord, uint64) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	data := make(map[string]string, len(k.data))
+	for key, v := range k.data {
+		data[key] = v
+	}
+	dedup := make(map[string]DedupRecord, len(k.dedup))
+	for id, rec := range k.dedup {
+		dedup[id] = rec
+	}
+	return data, dedup, k.applied
+}
+
+// loadSnapshot 用快照内容整体替换状态机。
+// 仅当快照边界更新（applied 更大）时才替换，保证重复安装、
+// 乱序到达的旧快照不会让状态回退；相同边界重复安装是幂等的。
+func (k *kvStore) loadSnapshot(data map[string]string, dedup map[string]DedupRecord, applied uint64) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if applied < k.applied {
+		return
+	}
+	k.data = make(map[string]string, len(data))
+	for key, v := range data {
+		k.data[key] = v
+	}
+	k.dedup = make(map[string]DedupRecord, len(dedup))
+	for id, rec := range dedup {
+		k.dedup[id] = rec
+	}
+	k.applied = applied
 }

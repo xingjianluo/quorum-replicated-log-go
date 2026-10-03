@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/xingjianluo/quorum-replicated-log-go/quorum"
 )
@@ -64,4 +65,42 @@ func main() {
 	for _, id := range []string{"r1", "r2", "r3"} {
 		fmt.Printf("[converge] %s: %v\n", id, c.Replica(id).KVSnapshot())
 	}
+
+	// 持续写入后做快照：清理已提交历史，磁盘占用回落。
+	for i := 4; i <= 20; i++ {
+		if _, err := leader2.Propose(quorum.Command{
+			Op: quorum.OpSet, Key: fmt.Sprintf("bulk-%d", i), Value: "v",
+			ClientID: "demo", Seq: uint64(i)}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	walPath := filepath.Join(dir, "r2", "wal.log")
+	before, _ := os.Stat(walPath)
+	snapIdx, err := leader2.Snapshot()
+	if err != nil {
+		log.Fatal(err)
+	}
+	after, _ := os.Stat(walPath)
+	fmt.Printf("[snapshot] 快照边界=%d, WAL %dB -> %dB（已提交历史被清理）\n",
+		snapIdx, before.Size(), after.Size())
+
+	// 副本离线期间历史被清理，恢复后通过快照传输追平。
+	c.Isolate("r3")
+	for i := 21; i <= 30; i++ {
+		if _, err := leader2.Propose(quorum.Command{
+			Op: quorum.OpSet, Key: fmt.Sprintf("bulk-%d", i), Value: "v",
+			ClientID: "demo", Seq: uint64(i)}); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if _, err := leader2.Snapshot(); err != nil {
+		log.Fatal(err)
+	}
+	c.Heal("r3")
+	if _, err := leader2.Propose(quorum.Command{Op: quorum.OpSet, Key: "final", Value: "1", ClientID: "demo", Seq: 31}); err != nil {
+		log.Fatal(err)
+	}
+	snap3, _ := c.Replica("r3").SnapshotBoundary()
+	fmt.Printf("[catch-up] r3 经快照追平: 快照边界=%d, 键数=%d（与领导者一致）\n",
+		snap3, len(c.Replica("r3").KVSnapshot()))
 }

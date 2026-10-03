@@ -18,11 +18,12 @@ import (
 // 一律视为崩溃造成的残缺尾部，将文件截断到最后一条完整记录处，
 // 残缺数据绝不进入内存日志。
 type wal struct {
-	mu      sync.Mutex
-	path    string
-	f       *os.File
-	fsync   bool
-	log     []Entry // 内存镜像，与磁盘完整记录一一对应
+	mu    sync.Mutex
+	path  string
+	f     *os.File
+	fsync bool
+	log   []Entry // 内存镜像，与磁盘完整记录一一对应
+	base  uint64  // 已被快照清理的最大日志索引；log 中只保留 Index > base 的记录
 }
 
 func openWAL(path string, fsync bool) (*wal, error) {
@@ -115,9 +116,43 @@ func (w *wal) truncateFrom(from uint64) error {
 	if keep == len(w.log) {
 		return nil
 	}
-	// 重新编码保留前缀，保证磁盘内容与内存一致。
+	if err := w.rewriteLocked(w.log[:keep]); err != nil {
+		return err
+	}
+	w.log = append([]Entry(nil), w.log[:keep]...)
+	return nil
+}
+
+// discardBefore 清理索引 <= index 的所有记录（快照后的日志压缩）。
+// 磁盘与内存同步重写；base 推进到 index，被清理的区间由快照接管。
+// 调用方必须先保证快照已原子落盘，否则崩溃会丢失已提交历史。
+func (w *wal) discardBefore(index uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	keep := 0
+	for keep < len(w.log) && w.log[keep].Index <= index {
+		keep++
+	}
+	if keep == 0 {
+		if index > w.base {
+			w.base = index
+		}
+		return nil
+	}
+	if err := w.rewriteLocked(w.log[keep:]); err != nil {
+		return err
+	}
+	w.log = append([]Entry(nil), w.log[keep:]...)
+	if index > w.base {
+		w.base = index
+	}
+	return nil
+}
+
+// rewriteLocked 用 keep 重写整个日志文件（调用方须持有 w.mu）。
+func (w *wal) rewriteLocked(keep []Entry) error {
 	var buf bytes.Buffer
-	for _, e := range w.log[:keep] {
+	for _, e := range keep {
 		payload := &bytes.Buffer{}
 		if err := gob.NewEncoder(payload).Encode(e); err != nil {
 			return err
@@ -139,8 +174,28 @@ func (w *wal) truncateFrom(from uint64) error {
 			return err
 		}
 	}
-	w.log = append([]Entry(nil), w.log[:keep]...)
-	return nil
+	_, err := w.f.Seek(int64(buf.Len()), io.SeekStart)
+	return err
+}
+
+// setBase 在恢复时设置已清理边界，并丢弃内存镜像中 <= base 的记录
+// （崩溃可能发生在快照落盘之后、日志清理之前，此类记录由快照接管）。
+func (w *wal) setBase(base uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.base = base
+	keep := 0
+	for keep < len(w.log) && w.log[keep].Index <= base {
+		keep++
+	}
+	w.log = append([]Entry(nil), w.log[keep:]...)
+}
+
+// baseIndex 返回已被快照清理的最大日志索引。
+func (w *wal) baseIndex() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.base
 }
 
 // entries 返回当前完整记录序列的副本。

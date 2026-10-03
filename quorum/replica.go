@@ -48,6 +48,11 @@ type Replica struct {
 	w    *wal
 	meta *metaStore
 	kv   *kvStore
+	snap *snapshotStore
+
+	// 快照边界：<= snapIndex 的日志已清理，其效果包含在快照中。
+	snapIndex uint64
+	snapTerm  uint64
 }
 
 // openReplica 从磁盘目录打开（或恢复）一个副本。
@@ -62,7 +67,10 @@ func openReplica(id, dir string, fsync bool) (*Replica, error) {
 	return r, nil
 }
 
-// recover 加载 WAL 与元数据，截断残缺尾部，并把已提交日志重放到状态机。
+// recover 加载快照、WAL 与元数据，截断残缺尾部，并把已提交日志重放到状态机。
+// 顺序：先装快照（状态机直接定位到 snapIndex），再重放快照之后的已提交日志；
+// 崩溃若发生在“快照落盘”与“日志清理”之间，WAL 中 <= snapIndex 的残留记录
+// 由 setBase 丢弃、且状态机按索引单调推进自动跳过，不会重复应用。
 func (r *Replica) recover() error {
 	w, err := openWAL(filepath.Join(r.dir, "wal.log"), r.fsync)
 	if err != nil {
@@ -73,10 +81,24 @@ func (r *Replica) recover() error {
 		w.close()
 		return err
 	}
-	r.w, r.meta = w, m
-	md := m.load()
-	r.term, r.votedFor, r.commitIdx = md.Term, md.VotedFor, md.CommitIndex
+	s, err := openSnapshot(filepath.Join(r.dir, "snapshot.json"), r.fsync)
+	if err != nil {
+		w.close()
+		return err
+	}
+	r.w, r.meta, r.snap = w, m, s
 	r.kv = newKVStore()
+	if sd, ok := s.load(); ok {
+		r.snapIndex, r.snapTerm = sd.LastIndex, sd.LastTerm
+		w.setBase(sd.LastIndex)
+		r.kv.loadSnapshot(sd.Data, sd.Dedup, sd.LastIndex)
+	}
+	md := m.load()
+	r.term, r.votedFor = md.Term, md.VotedFor
+	r.commitIdx = md.CommitIndex
+	if r.commitIdx < r.snapIndex {
+		r.commitIdx = r.snapIndex
+	}
 	r.applyCommittedLocked()
 	return nil
 }
@@ -96,6 +118,56 @@ func (r *Replica) applyCommittedLocked() {
 // persistMetaLocked 落盘任期/投票/提交索引。
 func (r *Replica) persistMetaLocked() {
 	_ = r.meta.save(metaData{Term: r.term, VotedFor: r.votedFor, CommitIndex: r.commitIdx})
+}
+
+// lastLogIndexTermLocked 返回日志逻辑尾部的索引与任期：
+// WAL 为空（全部清理或从未写入）时回退到快照边界，保证索引连续衔接。
+func (r *Replica) lastLogIndexTermLocked() (uint64, uint64) {
+	idx, term := r.w.lastIndexTerm()
+	if idx == 0 {
+		return r.snapIndex, r.snapTerm
+	}
+	return idx, term
+}
+
+// Snapshot 对已提交的状态机做快照，并清理快照覆盖的历史日志。
+// 顺序保证：快照原子落盘成功后才清理 WAL；
+//   - 快照写盘失败：返回错误，日志一条不删，已提交数据完好；
+//   - 落盘后、清理前崩溃：重启时快照生效，WAL 残留前缀被恢复逻辑跳过；
+//
+// 两种中断都不会丢失或重复应用已提交内容。
+// 返回快照边界索引；没有新的已提交内容时返回当前边界且不重复落盘。
+func (r *Replica) Snapshot() (uint64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.crashed {
+		return 0, ErrCrashed
+	}
+	data, dedup, applied := r.kv.snapshotState()
+	if applied <= r.snapIndex {
+		return r.snapIndex, nil // 无新内容，幂等返回
+	}
+	// 快照边界记录的任期：用于后续 AppendEntries 的前缀一致性检查。
+	term := r.snapTerm
+	if e, ok := r.w.at(applied); ok {
+		term = e.Term
+	}
+	sd := snapshotData{LastIndex: applied, LastTerm: term, Data: data, Dedup: dedup}
+	if err := r.snap.save(sd); err != nil {
+		return 0, err // 清理前失败：日志保留，已提交数据不受影响
+	}
+	r.snapIndex, r.snapTerm = applied, term
+	if err := r.w.discardBefore(applied); err != nil {
+		return 0, err
+	}
+	return applied, nil
+}
+
+// SnapshotBoundary 返回当前快照边界（测试/调试用）。
+func (r *Replica) SnapshotBoundary() (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapIndex, r.snapTerm
 }
 
 // ID 返回副本标识。
@@ -175,7 +247,7 @@ func (r *Replica) Propose(cmd Command) (string, error) {
 		return "", fmt.Errorf("%w (replica %s is %s, term %d)", ErrNotLeader, r.id, r.role, r.term)
 	}
 	// 1. 本地持久化（提交顺序与持久化顺序一致：先落盘后复制）。
-	lastIdx, _ := r.w.lastIndexTerm()
+	lastIdx, _ := r.lastLogIndexTermLocked()
 	entry := Entry{Term: r.term, Index: lastIdx + 1, Command: cmd}
 	if err := r.w.append(entry); err != nil {
 		r.mu.Unlock()
@@ -249,6 +321,8 @@ func (r *Replica) Read(key string) (string, error) {
 // ---------- 复制（领导者侧） ----------
 
 // syncPeer 把本副本日志中 peer 缺失的部分同步给它，并携带最新提交索引。
+// 若 peer 落后的起点早于已清理的历史（prev < snapIndex），日志补齐已不可能，
+// 改为先传输快照，再从快照边界继续增量同步。
 // 返回 peer 是否确认到当前日志尾部。发现更高任期时会自动下台并返回 false。
 func (r *Replica) syncPeer(p *Replica) bool {
 	for {
@@ -258,12 +332,41 @@ func (r *Replica) syncPeer(p *Replica) bool {
 			return false
 		}
 		prev := r.match[p.id]
-		lastIdx, _ := r.w.lastIndexTerm()
+		lastIdx, _ := r.lastLogIndexTermLocked()
 		if prev > lastIdx {
 			prev = lastIdx
 		}
+		if prev < r.snapIndex {
+			// 跟随者落后到已清理的历史之前：走快照传输。
+			sd, ok := r.snap.load()
+			term := r.term
+			r.mu.Unlock()
+			if !ok {
+				return false // 无快照可用（不应发生），放弃本轮
+			}
+			resp := p.HandleInstallSnapshot(InstallSnapshotRequest{
+				Term: term, LeaderID: r.id,
+				LastIndex: sd.LastIndex, LastTerm: sd.LastTerm,
+				Data: sd.Data, Dedup: sd.Dedup,
+			})
+			r.mu.Lock()
+			if resp.Term > r.term {
+				r.becomeFollowerLocked(resp.Term)
+				r.mu.Unlock()
+				return false
+			}
+			if resp.Err != nil {
+				r.mu.Unlock()
+				return false // 崩溃/分区等：不可达
+			}
+			r.match[p.id] = resp.Match
+			r.mu.Unlock()
+			continue // 快照安装完成，继续增量同步剩余日志
+		}
 		var prevTerm uint64
-		if prev > 0 {
+		if prev == r.snapIndex {
+			prevTerm = r.snapTerm // 前一条即快照边界
+		} else if prev > 0 {
 			if e, ok := r.w.at(prev); ok {
 				prevTerm = e.Term
 			}
@@ -323,17 +426,30 @@ func (r *Replica) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRes
 	}
 	r.role = Follower // 收到当前任期领导者的请求，确认跟随者身份
 
-	// 前缀一致性检查。
-	lastIdx, _ := r.w.lastIndexTerm()
-	if req.PrevIndex > 0 {
+	// 前缀一致性检查（快照边界视为日志的逻辑前缀）。
+	lastIdx, _ := r.lastLogIndexTermLocked()
+	switch {
+	case req.PrevIndex < r.snapIndex:
+		// 领导者尚未清理到本副本的快照边界：<= snapIndex 的记录已被
+		// 快照覆盖，直接跳过，仅衔接其后的部分（重复恢复安全）。
+	case req.PrevIndex == r.snapIndex:
+		if req.PrevTerm != r.snapTerm {
+			return AppendEntriesResponse{Term: r.term, Match: lastIdx, Err: fmt.Errorf(
+				"%w at snapshot boundary %d", ErrLogMismatch, req.PrevIndex)}
+		}
+	default:
 		e, ok := r.w.at(req.PrevIndex)
 		if !ok || e.Term != req.PrevTerm {
 			return AppendEntriesResponse{Term: r.term, Match: lastIdx, Err: fmt.Errorf(
 				"%w at prev index %d", ErrLogMismatch, req.PrevIndex)}
 		}
 	}
-	// 追加新日志：冲突处截断后写入（覆盖旧任期未提交的失效记录）。
+	// 追加新日志：跳过已被快照覆盖的记录；冲突处截断后写入
+	// （覆盖旧任期未提交的失效记录）。
 	for _, e := range req.Entries {
+		if e.Index <= r.snapIndex {
+			continue // 快照已覆盖：重复恢复/重复发送时是 no-op
+		}
 		if existing, ok := r.w.at(e.Index); ok {
 			if existing.Term != e.Term {
 				if err := r.w.truncateFrom(e.Index); err != nil {
@@ -350,14 +466,59 @@ func (r *Replica) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRes
 		}
 	}
 	// 推进提交索引并应用（不超过本地日志尾部）。
-	lastIdx, _ = r.w.lastIndexTerm()
+	lastIdx, _ = r.lastLogIndexTermLocked()
 	if req.LeaderCommit > r.commitIdx {
 		r.commitIdx = min(req.LeaderCommit, lastIdx)
 		r.persistMetaLocked()
 		r.applyCommittedLocked()
 	}
-	lastIdx, _ = r.w.lastIndexTerm()
+	lastIdx, _ = r.lastLogIndexTermLocked()
 	return AppendEntriesResponse{Term: r.term, Success: true, Match: lastIdx}
+}
+
+// HandleInstallSnapshot 处理领导者的快照传输：
+// 原子落盘快照、清理被覆盖的日志前缀、整体替换状态机。
+// 重复或更旧的快照是幂等 no-op，不会让状态回退。
+func (r *Replica) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshotResponse {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.crashed {
+		return InstallSnapshotResponse{Err: ErrCrashed}
+	}
+	if req.Term < r.term {
+		return InstallSnapshotResponse{Term: r.term, Err: fmt.Errorf(
+			"%w: req term %d < my term %d", ErrStaleTerm, req.Term, r.term)}
+	}
+	if req.Term > r.term {
+		r.becomeFollowerLocked(req.Term)
+	}
+	r.role = Follower
+
+	if req.LastIndex <= r.snapIndex {
+		// 重复/更旧的快照：已覆盖，幂等返回当前边界。
+		return InstallSnapshotResponse{Term: r.term, Match: r.snapIndex}
+	}
+	// 1. 快照原子落盘（先持久化，再动日志与状态机）。
+	sd := snapshotData{
+		LastIndex: req.LastIndex, LastTerm: req.LastTerm,
+		Data: req.Data, Dedup: req.Dedup,
+	}
+	if err := r.snap.save(sd); err != nil {
+		return InstallSnapshotResponse{Term: r.term, Err: err}
+	}
+	// 2. 清理被快照覆盖的日志前缀；快照之后的本地后缀保留，
+	//    若与领导者冲突会由后续 AppendEntries 的逐条任期检查截断。
+	if err := r.w.discardBefore(req.LastIndex); err != nil {
+		return InstallSnapshotResponse{Term: r.term, Err: err}
+	}
+	// 3. 推进边界、替换状态机、推进提交索引并落盘。
+	r.snapIndex, r.snapTerm = req.LastIndex, req.LastTerm
+	r.kv.loadSnapshot(req.Data, req.Dedup, req.LastIndex)
+	if r.commitIdx < req.LastIndex {
+		r.commitIdx = req.LastIndex
+	}
+	r.persistMetaLocked()
+	return InstallSnapshotResponse{Term: r.term, Match: req.LastIndex}
 }
 
 // ---------- 选主 ----------
@@ -372,7 +533,7 @@ func (r *Replica) HandleRequestVote(term uint64, candidateID string, lastIndex, 
 	if term < r.term {
 		return r.term, false
 	}
-	myLastIdx, myLastTerm := r.w.lastIndexTerm()
+	myLastIdx, myLastTerm := r.lastLogIndexTermLocked()
 	upToDate := lastTerm > myLastTerm || (lastTerm == myLastTerm && lastIndex >= myLastIdx)
 	if !upToDate {
 		return r.term, false
@@ -399,7 +560,7 @@ func (r *Replica) campaign(term uint64) bool {
 	r.role = Follower
 	r.termCommitted = false
 	r.persistMetaLocked()
-	lastIdx, lastTerm := r.w.lastIndexTerm()
+	lastIdx, lastTerm := r.lastLogIndexTermLocked()
 	r.mu.Unlock()
 
 	votes := 1
