@@ -18,11 +18,13 @@ import (
 // 一律视为崩溃造成的残缺尾部，将文件截断到最后一条完整记录处，
 // 残缺数据绝不进入内存日志。
 type wal struct {
-	mu      sync.Mutex
-	path    string
-	f       *os.File
-	fsync   bool
-	log     []Entry // 内存镜像，与磁盘完整记录一一对应
+	mu       sync.Mutex
+	path     string
+	f        *os.File
+	fsync    bool
+	log      []Entry // 内存镜像，与磁盘完整记录一一对应；所有记录 Index > base
+	base     uint64  // 日志基线：快照覆盖的最大索引，更早的记录已被清理
+	baseTerm uint64
 }
 
 func openWAL(path string, fsync bool) (*wal, error) {
@@ -115,9 +117,49 @@ func (w *wal) truncateFrom(from uint64) error {
 	if keep == len(w.log) {
 		return nil
 	}
-	// 重新编码保留前缀，保证磁盘内容与内存一致。
+	w.log = append([]Entry(nil), w.log[:keep]...)
+	return w.rewriteLocked()
+}
+
+// setBase 设置日志基线（快照点）：丢弃 Index <= base 的记录。
+// 用于恢复时对齐快照与 WAL：若崩溃发生在“快照已落盘、WAL 尚未压缩”
+// 之间，磁盘上仍留有快照覆盖的旧记录，这里将其清理掉。
+func (w *wal) setBase(base, baseTerm uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.base, w.baseTerm = base, baseTerm
+	keep := 0
+	for keep < len(w.log) && w.log[keep].Index <= base {
+		keep++
+	}
+	if keep == 0 {
+		return nil
+	}
+	w.log = append([]Entry(nil), w.log[keep:]...)
+	return w.rewriteLocked()
+}
+
+// compactThrough 压缩日志：丢弃 Index <= index 的记录，基线推进到 (index, term)。
+// 调用方必须保证快照已先落盘，本调用失败不影响已提交数据（旧记录仍在盘上）。
+func (w *wal) compactThrough(index, term uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if index <= w.base {
+		return nil
+	}
+	w.base, w.baseTerm = index, term
+	keep := 0
+	for keep < len(w.log) && w.log[keep].Index <= index {
+		keep++
+	}
+	w.log = append([]Entry(nil), w.log[keep:]...)
+	return w.rewriteLocked()
+}
+
+// rewriteLocked 用当前内存镜像整体重写日志文件（调用方需已持有 w.mu）。
+func (w *wal) rewriteLocked() error {
 	var buf bytes.Buffer
-	for _, e := range w.log[:keep] {
+	for _, e := range w.log {
 		payload := &bytes.Buffer{}
 		if err := gob.NewEncoder(payload).Encode(e); err != nil {
 			return err
@@ -134,12 +176,12 @@ func (w *wal) truncateFrom(from uint64) error {
 	if _, err := w.f.WriteAt(buf.Bytes(), 0); err != nil {
 		return err
 	}
-	if w.fsync {
-		if err := w.f.Sync(); err != nil {
-			return err
-		}
+	if _, err := w.f.Seek(int64(buf.Len()), io.SeekStart); err != nil {
+		return err
 	}
-	w.log = append([]Entry(nil), w.log[:keep]...)
+	if w.fsync {
+		return w.f.Sync()
+	}
 	return nil
 }
 
@@ -150,21 +192,33 @@ func (w *wal) entries() []Entry {
 	return append([]Entry(nil), w.log...)
 }
 
-// lastIndexTerm 返回最后一条记录的索引与任期；空日志返回 0,0。
+// lastIndexTerm 返回最后一条记录的索引与任期；
+// 日志已被压缩为空时返回基线（快照点）的索引与任期。
 func (w *wal) lastIndexTerm() (uint64, uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(w.log) == 0 {
-		return 0, 0
+		return w.base, w.baseTerm
 	}
 	last := w.log[len(w.log)-1]
 	return last.Index, last.Term
 }
 
+// baseIndex 返回日志基线索引（快照覆盖的最大索引，0 表示尚未快照）。
+func (w *wal) baseIndex() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.base
+}
+
 // at 返回指定索引处的记录；越界返回 false。
+// 索引恰好等于基线时返回一条只含索引/任期的合成记录（供前缀一致性检查）。
 func (w *wal) at(index uint64) (Entry, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if index == w.base && index > 0 {
+		return Entry{Index: w.base, Term: w.baseTerm}, true
+	}
 	for _, e := range w.log {
 		if e.Index == index {
 			return e, true

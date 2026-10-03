@@ -12,6 +12,9 @@ type Config struct {
 	ReplicaIDs []string
 	Dir        string // 数据根目录，每个副本一个子目录
 	Fsync      bool   // 是否每次写盘都 fsync（测试可置 true 验证崩溃恢复语义）
+	// SnapshotThreshold：WAL 中未压缩记录数超过该阈值时自动快照并清理旧日志；
+	// 0 表示关闭自动快照（仍可调用 Replica.Snapshot 手动快照）。
+	SnapshotThreshold int
 }
 
 // Cluster 管理同一进程内的多个副本，并提供故障注入能力

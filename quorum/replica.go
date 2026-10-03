@@ -47,6 +47,7 @@ type Replica struct {
 
 	w    *wal
 	meta *metaStore
+	snap *snapshotStore
 	kv   *kvStore
 }
 
@@ -62,7 +63,8 @@ func openReplica(id, dir string, fsync bool) (*Replica, error) {
 	return r, nil
 }
 
-// recover 加载 WAL 与元数据，截断残缺尾部，并把已提交日志重放到状态机。
+// recover 加载 WAL、元数据与快照，截断残缺尾部，并把已提交日志重放到状态机。
+// 恢复顺序：先恢复快照（状态机直接对齐到快照点），再重放快照点之后的已提交日志。
 func (r *Replica) recover() error {
 	w, err := openWAL(filepath.Join(r.dir, "wal.log"), r.fsync)
 	if err != nil {
@@ -73,10 +75,28 @@ func (r *Replica) recover() error {
 		w.close()
 		return err
 	}
-	r.w, r.meta = w, m
+	ss := openSnapshotStore(filepath.Join(r.dir, "snapshot.json"), r.fsync)
+	snap, err := ss.load()
+	if err != nil {
+		w.close()
+		return err
+	}
+	r.w, r.meta, r.snap = w, m, ss
 	md := m.load()
 	r.term, r.votedFor, r.commitIdx = md.Term, md.VotedFor, md.CommitIndex
 	r.kv = newKVStore()
+	if snap != nil {
+		// 快照已落盘：WAL 中被覆盖的旧记录（可能因崩溃来不及压缩）按基线清理。
+		if err := w.setBase(snap.LastIndex, snap.LastTerm); err != nil {
+			return err
+		}
+		r.kv.restore(snap)
+		if r.commitIdx < snap.LastIndex {
+			// 防御：提交索引不应低于快照点（快照只含已提交状态）。
+			r.commitIdx = snap.LastIndex
+			r.persistMetaLocked()
+		}
+	}
 	r.applyCommittedLocked()
 	return nil
 }
@@ -207,12 +227,18 @@ func (r *Replica) Propose(cmd Command) (string, error) {
 			ErrNoQuorum, acks, len(r.cluster.cfg.ReplicaIDs), entry.Index)
 	}
 	// 4. 提交：推进提交索引、落盘、应用。
-	r.commitIdx = entry.Index
+	// 并发 Propose 下，索引更大的写入可能先完成提交；
+	// 提交索引必须单调推进，否则后完成的较小索引会把 commitIdx 回退，
+	// 导致尾部日志永远不在跟随者提交（跟随者状态机丢写）。
+	if entry.Index > r.commitIdx {
+		r.commitIdx = entry.Index
+	}
 	if entry.Term == r.term {
 		r.termCommitted = true
 	}
 	r.persistMetaLocked()
 	r.applyCommittedLocked()
+	r.maybeAutoSnapshotLocked()
 	r.mu.Unlock()
 
 	// 5. 把新的提交索引通知跟随者（尽力而为，失败不影响已提交结果）。
@@ -250,6 +276,7 @@ func (r *Replica) Read(key string) (string, error) {
 
 // syncPeer 把本副本日志中 peer 缺失的部分同步给它，并携带最新提交索引。
 // 返回 peer 是否确认到当前日志尾部。发现更高任期时会自动下台并返回 false。
+// 若 peer 落后的起点早于已压缩清理的日志，则改为发送快照对齐状态。
 func (r *Replica) syncPeer(p *Replica) bool {
 	for {
 		r.mu.Lock()
@@ -258,6 +285,36 @@ func (r *Replica) syncPeer(p *Replica) bool {
 			return false
 		}
 		prev := r.match[p.id]
+		base := r.w.baseIndex()
+		if prev < base {
+			// 跟随者落后的起点已被快照清理：发送快照让其直接对齐到快照点。
+			snap, err := r.snap.load()
+			if err != nil || snap == nil {
+				r.mu.Unlock()
+				return false
+			}
+			req := InstallSnapshotRequest{
+				Term: r.term, LeaderID: r.id,
+				Snapshot: *snap, LeaderCommit: r.commitIdx,
+			}
+			r.mu.Unlock()
+
+			resp := p.HandleInstallSnapshot(req)
+
+			r.mu.Lock()
+			if resp.Term > r.term {
+				r.becomeFollowerLocked(resp.Term)
+				r.mu.Unlock()
+				return false
+			}
+			if resp.Success {
+				r.match[p.id] = resp.Match
+				r.mu.Unlock()
+				continue // 快照对齐后继续同步快照点之后的日志
+			}
+			r.mu.Unlock()
+			return false // 崩溃/分区等：不可达
+		}
 		lastIdx, _ := r.w.lastIndexTerm()
 		if prev > lastIdx {
 			prev = lastIdx
@@ -333,7 +390,11 @@ func (r *Replica) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRes
 		}
 	}
 	// 追加新日志：冲突处截断后写入（覆盖旧任期未提交的失效记录）。
+	base := r.w.baseIndex()
 	for _, e := range req.Entries {
+		if e.Index <= base {
+			continue // 已被本地快照覆盖的记录：跳过，不重复追加
+		}
 		if existing, ok := r.w.at(e.Index); ok {
 			if existing.Term != e.Term {
 				if err := r.w.truncateFrom(e.Index); err != nil {
@@ -355,6 +416,7 @@ func (r *Replica) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRes
 		r.commitIdx = min(req.LeaderCommit, lastIdx)
 		r.persistMetaLocked()
 		r.applyCommittedLocked()
+		r.maybeAutoSnapshotLocked()
 	}
 	lastIdx, _ = r.w.lastIndexTerm()
 	return AppendEntriesResponse{Term: r.term, Success: true, Match: lastIdx}
@@ -445,4 +507,102 @@ func min(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// ---------- 快照 ----------
+
+// Snapshot 对已提交状态做快照，并清理快照点及更早的日志记录。
+// 顺序保证：快照先原子落盘，成功后才压缩 WAL；
+// 快照失败或中途崩溃都不会影响已提交数据（旧日志原样保留，
+// 恢复时按快照基线过滤 WAL，重复恢复同一快照是幂等的）。
+func (r *Replica) Snapshot() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.crashed {
+		return ErrCrashed
+	}
+	return r.snapshotLocked()
+}
+
+// snapshotLocked 在已持有 r.mu 时执行快照（调用方需保证未崩溃）。
+func (r *Replica) snapshotLocked() error {
+	applied := r.kv.appliedIndex()
+	base := r.w.baseIndex()
+	if applied == 0 || applied <= base {
+		return nil // 没有新的已提交状态可快照
+	}
+	e, ok := r.w.at(applied)
+	if !ok {
+		return fmt.Errorf("quorum: snapshot point %d not in log (base %d)", applied, base)
+	}
+	snap := r.kv.capture(applied, e.Term)
+	if err := r.snap.save(snap); err != nil {
+		return err // 快照落盘失败：不触碰 WAL，已提交数据不受影响
+	}
+	// 快照已持久化，清理被覆盖的日志；此步失败同样安全（恢复时按基线过滤）。
+	return r.w.compactThrough(snap.LastIndex, snap.LastTerm)
+}
+
+// maybeAutoSnapshotLocked 在 WAL 长度超过配置的阈值时自动快照（0 表示关闭）。
+func (r *Replica) maybeAutoSnapshotLocked() {
+	th := r.cluster.cfg.SnapshotThreshold
+	if th <= 0 {
+		return
+	}
+	lastIdx, _ := r.w.lastIndexTerm()
+	if lastIdx-r.w.baseIndex() >= uint64(th) {
+		_ = r.snapshotLocked()
+	}
+}
+
+// HandleInstallSnapshot 处理领导者的快照传输：用于跟随者落后的起点
+// 早于领导者已清理日志的场景。整体流程幂等：同一快照重复发送、
+// 或恢复过程中崩溃重发，状态都保持一致，不会重复应用。
+func (r *Replica) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshotResponse {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.crashed {
+		return InstallSnapshotResponse{Err: ErrCrashed}
+	}
+	if req.Term < r.term {
+		return InstallSnapshotResponse{Term: r.term, Err: fmt.Errorf(
+			"%w: req term %d < my term %d", ErrStaleTerm, req.Term, r.term)}
+	}
+	if req.Term > r.term {
+		r.becomeFollowerLocked(req.Term)
+	}
+	r.role = Follower
+
+	snap := req.Snapshot
+	if snap.LastIndex <= r.w.baseIndex() {
+		// 本地快照已覆盖该点：重复发送，直接确认（幂等）。
+		return InstallSnapshotResponse{Term: r.term, Success: true, Match: r.w.baseIndex()}
+	}
+	// 快照点与本地日志冲突（同索引不同任期）：快照点之后的本地后缀全部失效。
+	if existing, ok := r.w.at(snap.LastIndex); ok && existing.Term != snap.LastTerm {
+		if err := r.w.truncateFrom(snap.LastIndex); err != nil {
+			return InstallSnapshotResponse{Term: r.term, Err: err}
+		}
+	}
+	// 1. 快照原子落盘：先持久化，再改内存、再清理日志。
+	if err := r.snap.save(&snap); err != nil {
+		return InstallSnapshotResponse{Term: r.term, Err: err}
+	}
+	// 2. 清理被快照覆盖的日志，保留快照点之后仍一致的后缀。
+	if err := r.w.compactThrough(snap.LastIndex, snap.LastTerm); err != nil {
+		return InstallSnapshotResponse{Term: r.term, Err: err}
+	}
+	// 3. 状态机整体替换为快照内容（含客户端去重表，重试不会重复应用）。
+	r.kv.restore(&snap)
+	// 4. 提交索引至少推进到快照点，并按领导者提交位继续推进、应用后缀。
+	if r.commitIdx < snap.LastIndex {
+		r.commitIdx = snap.LastIndex
+	}
+	lastIdx, _ := r.w.lastIndexTerm()
+	if req.LeaderCommit > r.commitIdx {
+		r.commitIdx = min(req.LeaderCommit, lastIdx)
+	}
+	r.persistMetaLocked()
+	r.applyCommittedLocked()
+	return InstallSnapshotResponse{Term: r.term, Success: true, Match: snap.LastIndex}
 }

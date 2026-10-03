@@ -67,3 +67,20 @@ type AppendEntriesResponse struct {
 	Match   uint64 // 已确认匹配的最大日志索引
 	Err     error  // 可区分的拒绝原因
 }
+
+// InstallSnapshotRequest 是领导者发给严重落后跟随者的快照传输请求：
+// 跟随者落后的起点早于领导者已压缩清理的日志时，用快照直接对齐状态。
+type InstallSnapshotRequest struct {
+	Term         uint64
+	LeaderID     string
+	Snapshot     Snapshot
+	LeaderCommit uint64
+}
+
+// InstallSnapshotResponse 是跟随者对快照传输的响应。
+type InstallSnapshotResponse struct {
+	Term    uint64
+	Success bool
+	Match   uint64 // 快照覆盖的最大日志索引
+	Err     error
+}

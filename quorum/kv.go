@@ -88,3 +88,37 @@ func (k *kvStore) snapshot() map[string]string {
 	}
 	return out
 }
+
+// capture 导出当前已提交状态的完整快照（数据 + 去重表 + 已应用索引）。
+// 去重表必须随快照一起保存：否则跨快照的客户端重试会被重复应用。
+func (k *kvStore) capture(lastIndex, lastTerm uint64) *Snapshot {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	data := make(map[string]string, len(k.data))
+	for key, v := range k.data {
+		data[key] = v
+	}
+	dedup := make(map[string]dedupRecord, len(k.dedup))
+	for id, rec := range k.dedup {
+		dedup[id] = rec
+	}
+	return &Snapshot{LastIndex: lastIndex, LastTerm: lastTerm, Data: data, Dedup: dedup}
+}
+
+// restore 用快照整体替换状态机（数据、去重表、已应用索引）。
+// 重复恢复同一快照是幂等的：状态被替换为相同内容，applied 不回退也不膨胀。
+func (k *kvStore) restore(snap *Snapshot) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	data := make(map[string]string, len(snap.Data))
+	for key, v := range snap.Data {
+		data[key] = v
+	}
+	dedup := make(map[string]dedupRecord, len(snap.Dedup))
+	for id, rec := range snap.Dedup {
+		dedup[id] = rec
+	}
+	k.data = data
+	k.dedup = dedup
+	k.applied = snap.LastIndex
+}
